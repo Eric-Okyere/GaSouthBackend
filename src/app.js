@@ -6,6 +6,7 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 
 const publicRoutes = require('./routes/public');
+const registrationRoutes = require('./routes/registration');
 const adminAuthRoutes = require('./routes/adminAuth');
 const adminRoutes = require('./routes/admin');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
@@ -57,8 +58,18 @@ function createApp() {
   });
   app.use('/api/schools/:id/attendance', attendanceLimiter);
 
+  const registerLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests. Please wait a moment and try again.' }
+  });
+  app.use('/api/register', registerLimiter);
+
   app.get('/api/health', (req, res) => res.json({ ok: true }));
   app.use('/api', publicRoutes);
+  app.use('/api', registrationRoutes);
   app.use('/api/admin/auth', adminAuthRoutes);
   app.use('/api/admin', adminRoutes);
 

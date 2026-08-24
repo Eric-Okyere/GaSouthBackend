@@ -20,6 +20,16 @@ router.get('/schools', async (req, res, next) => {
   }
 });
 
+router.get('/schools/:id', async (req, res, next) => {
+  try {
+    const school = await School.findById(req.params.id);
+    if (!school) return res.status(404).json({ error: 'School not found.' });
+    res.json(toSchoolJSON(school));
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post('/schools', async (req, res, next) => {
   try {
     const name = String(req.body.name || '').trim();
@@ -200,7 +210,18 @@ router.delete('/teachers/:id', async (req, res, next) => {
 });
 
 function toTeacherJSON(t) {
-  return { id: t._id, school: t.school, staffId: t.staffId, name: t.name, active: t.active };
+  return {
+    id: t._id,
+    school: t.school,
+    staffId: t.staffId,
+    name: t.name,
+    active: t.active,
+    source: t.source || 'admin',
+    dateOfBirth: t.dateOfBirth || null,
+    classTeaching: t.classTeaching || '',
+    association: t.association || '',
+    phoneNumber: t.phoneNumber || ''
+  };
 }
 
 /* ------------------------------- Records ------------------------------- */
