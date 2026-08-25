@@ -2,6 +2,7 @@ const express = require('express');
 const School = require('../models/School');
 const Teacher = require('../models/Teacher');
 const Attendance = require('../models/Attendance');
+const TermSettings = require('../models/TermSettings');
 const { requireAdmin } = require('../middleware/auth');
 const { toCSV } = require('../utils/csv');
 const { dateStr, dayBounds, daysBetween, startOfMonthStr } = require('../utils/time');
@@ -746,6 +747,86 @@ router.get('/stats/today', async (req, res, next) => {
       flagged,
       perSchool: Array.from(perSchoolMap.values()).sort((a, b) => a.name.localeCompare(b.name))
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ------------------------------- Academic term dates ------------------------------- */
+// A single district-wide settings document (there's only ever one "current"
+// set of term dates, not one per school) covering GES's three terms a year,
+// each with an open ("first day back") and closing ("last day of term")
+// date. Read/written as a singleton: GET returns it (or all-blank defaults
+// if an admin hasn't set anything yet), PUT upserts it into existence on
+// first use.
+
+const TERM_KEYS = ['term1', 'term2', 'term3'];
+const TERM_LABELS = { term1: 'First term', term2: 'Second term', term3: 'Third term' };
+
+function toTermJSON(term) {
+  return {
+    startDate: (term && term.startDate) || null,
+    endDate: (term && term.endDate) || null
+  };
+}
+
+function toTermSettingsJSON(doc) {
+  return {
+    academicYear: (doc && doc.academicYear) || '',
+    term1: toTermJSON(doc && doc.term1),
+    term2: toTermJSON(doc && doc.term2),
+    term3: toTermJSON(doc && doc.term3)
+  };
+}
+
+router.get('/term-dates', async (req, res, next) => {
+  try {
+    const doc = await TermSettings.findOne({}).lean();
+    res.json(toTermSettingsJSON(doc));
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.put('/term-dates', async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const update = {};
+
+    if (typeof body.academicYear === 'string') update.academicYear = body.academicYear.trim();
+
+    const existing = (await TermSettings.findOne({}).lean()) || {};
+
+    for (const key of TERM_KEYS) {
+      if (!(key in body)) continue; // this term wasn't part of the request: leave it untouched
+      const raw = body[key] || {};
+      const currentTerm = existing[key] || {};
+      const merged = { startDate: currentTerm.startDate || null, endDate: currentTerm.endDate || null };
+
+      for (const field of ['startDate', 'endDate']) {
+        if (!(field in raw)) continue; // this one field wasn't sent: keep what's on file
+        const val = raw[field];
+        if (val === null || val === '') {
+          merged[field] = null;
+          continue;
+        }
+        const parsed = new Date(val);
+        if (Number.isNaN(parsed.getTime())) {
+          return res.status(400).json({
+            error: `${TERM_LABELS[key]}: that ${field === 'startDate' ? 'opening' : 'closing'} date isn't valid.`
+          });
+        }
+        merged[field] = parsed;
+      }
+
+      if (merged.startDate && merged.endDate && merged.startDate > merged.endDate) {
+        return res.status(400).json({ error: `${TERM_LABELS[key]}: the opening date must be on or before the closing date.` });
+      }
+      update[key] = merged;
+    }
+
+    const saved = await TermSettings.findOneAndUpdate({}, update, { new: true, upsert: true, setDefaultsOnInsert: true });
+    res.json(toTermSettingsJSON(saved));
   } catch (err) {
     next(err);
   }
