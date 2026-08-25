@@ -364,6 +364,93 @@ function toTeacherJSON(t) {
   };
 }
 
+/* ------------------------------- District-wide teacher directory ------------------------------- */
+
+/**
+ * GET /teachers — every teacher in the district, at every school, active or
+ * not, with the school's name attached — the data behind the district-wide
+ * Teachers page (sort/search client-side, click through to one teacher's
+ * detail). Deliberately unpaginated, same reasoning as the school directory:
+ * a district's whole roster is small enough to sort and search in the
+ * browser without round-tripping to the server on every keystroke.
+ */
+router.get('/teachers', async (req, res, next) => {
+  try {
+    const teachers = await Teacher.find().sort({ name: 1 }).populate('school', 'name').lean();
+    res.json(teachers.map(toDirectoryTeacherJSON));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /teachers/:id — one teacher's full roster record, plus present/absent
+ * counts over a date range (`?start=&end=`, default this month so far — same
+ * convention as the per-school attendance summary). This is the number an
+ * admin actually wants after clicking into someone from the district
+ * directory: how many school days they've shown up for vs. missed, not just
+ * their contact card.
+ */
+router.get('/teachers/:id', async (req, res, next) => {
+  try {
+    const teacher = await Teacher.findById(req.params.id).populate('school', 'name').lean();
+    if (!teacher) return res.status(404).json({ error: 'Teacher not found.' });
+
+    const today = dateStr();
+    const start = req.query.start || startOfMonthStr(today);
+    const end = req.query.end && req.query.end < today ? req.query.end : today; // never count into the future
+    if (start > end) return res.status(400).json({ error: 'start must be on or before end.' });
+
+    // Same "count only from whichever is later: range start, or the day
+    // they joined" rule as the per-school summary — a teacher added
+    // mid-range isn't shown absent for days before they existed.
+    const joined = teacher.createdAt ? dateStr(new Date(teacher.createdAt)) : start;
+    const effectiveStart = joined > start ? joined : start;
+    const allDays = daysBetween(effectiveStart, end, { excludeWeekends: true });
+
+    const checkinRows = allDays.length && teacher.school
+      ? await Attendance.find({
+          school: teacher.school._id,
+          staffId: teacher.staffId,
+          type: 'in',
+          dateKey: { $gte: effectiveStart, $lte: end }
+        }).select('dateKey').lean()
+      : [];
+    const presentSet = new Set(checkinRows.map((r) => r.dateKey));
+    const presentCount = allDays.filter((d) => presentSet.has(d)).length;
+
+    res.json({
+      teacher: toDirectoryTeacherJSON(teacher),
+      attendance: {
+        start,
+        end,
+        totalSchoolDays: allDays.length,
+        presentDays: presentCount,
+        absentDays: allDays.length - presentCount
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+function toDirectoryTeacherJSON(t) {
+  return {
+    id: t._id,
+    staffId: t.staffId,
+    name: t.name,
+    school: t.school ? { id: t.school._id, name: t.school.name } : null,
+    active: t.active,
+    source: t.source || 'admin',
+    dateOfBirth: t.dateOfBirth || null,
+    classTeaching: t.classTeaching || '',
+    association: t.association || '',
+    phoneNumber: t.phoneNumber || '',
+    deviceBound: !!t.deviceTokenHash,
+    deviceBoundAt: t.deviceBoundAt || null
+  };
+}
+
 /* ------------------------------- Records ------------------------------- */
 
 function buildRecordFilter(query) {
