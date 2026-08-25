@@ -5,6 +5,7 @@ const Attendance = require('../models/Attendance');
 const { distanceMeters } = require('../utils/geo');
 const { dateStr, dayBounds } = require('../utils/time');
 const { hashDeviceToken } = require('../utils/device');
+const { ensureCodesForList, codeOrIdFilter } = require('../utils/schoolCode');
 
 const router = express.Router();
 
@@ -15,10 +16,15 @@ const STORE_PRECISE_LOCATION = process.env.STORE_PRECISE_LOCATION === 'true';
 router.get('/schools', async (req, res, next) => {
   try {
     const schools = await School.find({ active: true }).sort({ name: 1 }).lean();
+    // Every school here feeds a QR code or a fallback link on the directory
+    // page, so a code is assigned up front for any school that doesn't
+    // have one yet (see utils/schoolCode.js).
+    await ensureCodesForList(School, schools);
     res.json(
       schools.map((s) => ({
         id: s._id,
         name: s.name,
+        code: s.code,
         hasAnchor: s.anchorLat != null && s.anchorLng != null
       }))
     );
@@ -27,10 +33,10 @@ router.get('/schools', async (req, res, next) => {
   }
 });
 
-/** GET /api/schools/:id — header info for the check-in page. */
+/** GET /api/schools/:id — header info for the check-in page. `:id` may be a school's Mongo id or its short code. */
 router.get('/schools/:id', async (req, res, next) => {
   try {
-    const school = await School.findOne({ _id: req.params.id, active: true }).lean();
+    const school = await School.findOne(codeOrIdFilter(req.params.id, { active: true })).lean();
     if (!school) return res.status(404).json({ error: 'School not found.' });
 
     const { start, end } = dayBounds(dateStr());
@@ -52,7 +58,7 @@ router.get('/schools/:id/status', async (req, res, next) => {
     const staffId = String(req.query.staffId || '').trim().toUpperCase();
     if (!staffId) return res.status(400).json({ error: 'staffId is required.' });
 
-    const school = await School.findOne({ _id: req.params.id, active: true }).lean();
+    const school = await School.findOne(codeOrIdFilter(req.params.id, { active: true })).lean();
     if (!school) return res.status(404).json({ error: 'School not found.' });
 
     const teacher = await Teacher.findOne({ school: school._id, staffId, active: true }).lean();
@@ -108,7 +114,7 @@ router.get('/schools/:id/status', async (req, res, next) => {
 /** POST /api/schools/:id/attendance — record a check-in or check-out. */
 router.post('/schools/:id/attendance', async (req, res, next) => {
   try {
-    const school = await School.findOne({ _id: req.params.id, active: true }).lean();
+    const school = await School.findOne(codeOrIdFilter(req.params.id, { active: true })).lean();
     if (!school) return res.status(404).json({ error: 'School not found.' });
 
     const staffId = String(req.body.staffId || '').trim().toUpperCase();

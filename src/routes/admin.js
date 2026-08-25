@@ -4,6 +4,7 @@ const Teacher = require('../models/Teacher');
 const Attendance = require('../models/Attendance');
 const TermSettings = require('../models/TermSettings');
 const { requireAdmin } = require('../middleware/auth');
+const { generateUniqueCode, ensureCode, ensureCodesForList } = require('../utils/schoolCode');
 const { toCSV } = require('../utils/csv');
 const { dateStr, dayBounds, daysBetween, startOfMonthStr } = require('../utils/time');
 
@@ -15,6 +16,7 @@ router.use(requireAdmin);
 router.get('/schools', async (req, res, next) => {
   try {
     const schools = await School.find().sort({ name: 1 }).lean();
+    await ensureCodesForList(School, schools);
     res.json(schools.map(toSchoolJSON));
   } catch (err) {
     next(err);
@@ -25,6 +27,7 @@ router.get('/schools/:id', async (req, res, next) => {
   try {
     const school = await School.findById(req.params.id);
     if (!school) return res.status(404).json({ error: 'School not found.' });
+    await ensureCode(School, school);
     res.json(toSchoolJSON(school));
   } catch (err) {
     next(err);
@@ -35,7 +38,9 @@ router.post('/schools', async (req, res, next) => {
   try {
     const name = String(req.body.name || '').trim();
     if (!name) return res.status(400).json({ error: 'School name is required.' });
-    const school = await School.create({ name });
+    // Short check-in link code, assigned up front — see utils/schoolCode.js.
+    const code = await generateUniqueCode(School);
+    const school = await School.create({ name, code });
     res.status(201).json(toSchoolJSON(school));
   } catch (err) {
     next(err);
@@ -119,7 +124,8 @@ function toSchoolJSON(s) {
     active: s.active,
     anchorLat: s.anchorLat,
     anchorLng: s.anchorLng,
-    anchorSetAt: s.anchorSetAt
+    anchorSetAt: s.anchorSetAt,
+    code: s.code || null
   };
 }
 
