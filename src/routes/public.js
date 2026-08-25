@@ -4,8 +4,7 @@ const Teacher = require('../models/Teacher');
 const Attendance = require('../models/Attendance');
 const { distanceMeters } = require('../utils/geo');
 const { dateStr, dayBounds } = require('../utils/time');
-const { MAX_FAILED_ATTEMPTS, LOCKOUT_MINUTES, isValidPin, hashPin, comparePin, isLockedOut } = require('../utils/pin');
-const { recognizeDevice } = require('../utils/device');
+const { hashDeviceToken } = require('../utils/device');
 
 const router = express.Router();
 
@@ -66,11 +65,10 @@ router.get('/schools/:id/status', async (req, res, next) => {
 
     const next_ = !checkIn ? 'in' : !checkOut ? 'out' : 'done';
 
-    // hasPin tells the check-in page whether to prompt "create a PIN" (first
-    // time this staff ID is ever seen, or an older roster entry from before
-    // this feature existed) or "enter your PIN" (every time after that).
-    const hasPin = !!(teacher && teacher.pinHash);
-    const locked = !!(teacher && isLockedOut(teacher));
+    // deviceBound tells the check-in page whether this staff ID already has
+    // a trusted device on file. If not, this check-in is the one that
+    // establishes it — worth a friendly one-time note on the frontend.
+    const deviceBound = !!(teacher && teacher.deviceTokenHash);
 
     res.json({
       staffId,
@@ -78,9 +76,7 @@ router.get('/schools/:id/status', async (req, res, next) => {
       next: next_,
       checkedInAt: checkIn ? checkIn.at : null,
       checkedOutAt: checkOut ? checkOut.at : null,
-      hasPin,
-      locked,
-      lockedUntil: locked ? teacher.pinLockedUntil : null
+      deviceBound
     });
   } catch (err) {
     next(err);
@@ -96,12 +92,10 @@ router.post('/schools/:id/attendance', async (req, res, next) => {
     const staffId = String(req.body.staffId || '').trim().toUpperCase();
     if (!staffId) return res.status(400).json({ error: 'Staff ID is required.' });
 
-    // Not .lean() — a PIN may need to be created or its attempt count
-    // updated on this same document below.
     let teacher = await Teacher.findOne({ school: school._id, staffId, active: true });
     // Recorded on the Attendance row below as `verified` — was this staff ID
     // already on the roster *before* this request, as opposed to a roster
-    // entry the PIN step below is about to create on the fly.
+    // entry the device-binding step below is about to create on the fly.
     const wasOnRoster = !!teacher;
     const typedName = String(req.body.name || '').trim();
     if (!teacher && !typedName) {
@@ -144,94 +138,48 @@ router.post('/schools/:id/attendance', async (req, res, next) => {
       });
     }
 
-    // --- Individual PIN check ---------------------------------------------
+    // --- Device binding ------------------------------------------------------
     // This is the anti-impersonation control: a staff ID printed on a
-    // school's public QR flyer is not secret, so it can't prove who's
-    // actually standing there. A PIN chosen privately by the teacher can.
-    // First time a staff ID is ever used to check in (no PIN on file yet,
-    // whether because the roster entry is brand new or predates this
-    // feature), the submitted PIN becomes that teacher's PIN going forward.
-    // Every time after that, the submitted PIN must match. Deliberately
-    // checked only after the same-day-state and coverage checks above, so a
-    // request that was going to be rejected anyway doesn't burn a PIN
-    // attempt or lock someone out over a redundant tap.
-    const pin = String(req.body.pin || '').trim();
-    const pinConfirm = req.body.pinConfirm != null ? String(req.body.pinConfirm).trim() : null;
-    const hasPin = !!(teacher && teacher.pinHash);
-
-    if (teacher && isLockedOut(teacher)) {
-      const minutesLeft = Math.max(1, Math.ceil((new Date(teacher.pinLockedUntil).getTime() - Date.now()) / 60000));
-      return res.status(423).json({
-        error: `Too many incorrect PIN attempts. Try again in about ${minutesLeft} minute${minutesLeft === 1 ? '' : 's'}.`,
-        locked: true,
-        lockedUntil: teacher.pinLockedUntil
+    // school's public QR flyer is not secret, so typing it can't prove who's
+    // actually standing there. The first check-in for a staff ID ("logging
+    // in" for the first time) binds it to that browser; every check-in/out
+    // after that must come from the same device, or it's rejected outright
+    // — nothing is written. Deliberately checked only after the same-day-
+    // state and coverage checks above, so a request that was going to be
+    // rejected anyway never affects device binding.
+    const deviceToken = String(req.body.deviceToken || '').trim();
+    if (!deviceToken) {
+      return res.status(400).json({
+        error: "We couldn't identify your device. Please allow this site to store data in your browser and try again.",
+        deviceRequired: true
       });
     }
+    const deviceTokenHash = hashDeviceToken(deviceToken);
 
-    if (!hasPin) {
-      if (!isValidPin(pin)) {
-        return res.status(400).json({ error: 'Choose a 4–6 digit PIN.', pinRequired: true, creatingPin: true });
-      }
-      if (pinConfirm === null || pin !== pinConfirm) {
-        return res.status(400).json({ error: 'PIN and confirmation do not match.', pinRequired: true, creatingPin: true });
-      }
-      const pinHash = await hashPin(pin);
-      if (teacher) {
-        teacher = await Teacher.findByIdAndUpdate(
-          teacher._id,
-          { pinHash, failedPinAttempts: 0, pinLockedUntil: null },
-          { new: true }
-        );
-      } else {
-        teacher = await Teacher.create({
-          school: school._id,
-          staffId,
-          name,
-          source: 'checkin',
-          pinHash
+    if (teacher && teacher.deviceTokenHash) {
+      if (teacher.deviceTokenHash !== deviceTokenHash) {
+        return res.status(403).json({
+          error: 'This device isn’t recognized for this staff ID. Please check in from the device you first used, or ask your school admin to reset your device.',
+          deviceMismatch: true
         });
       }
+    } else if (teacher) {
+      teacher = await Teacher.findByIdAndUpdate(
+        teacher._id,
+        { deviceTokenHash, deviceBoundAt: new Date() },
+        { new: true }
+      );
     } else {
-      if (!isValidPin(pin)) {
-        return res.status(400).json({ error: 'Enter your 4–6 digit PIN.', pinRequired: true });
-      }
-      const ok = await comparePin(pin, teacher.pinHash);
-      if (!ok) {
-        const failedPinAttempts = (teacher.failedPinAttempts || 0) + 1;
-        const locked = failedPinAttempts >= MAX_FAILED_ATTEMPTS;
-        const update = locked
-          ? { failedPinAttempts: 0, pinLockedUntil: new Date(Date.now() + LOCKOUT_MINUTES * 60 * 1000) }
-          : { failedPinAttempts };
-        teacher = await Teacher.findByIdAndUpdate(teacher._id, update, { new: true });
-        if (locked) {
-          return res.status(423).json({
-            error: `Too many incorrect PIN attempts. Try again in about ${LOCKOUT_MINUTES} minutes.`,
-            locked: true,
-            lockedUntil: teacher.pinLockedUntil
-          });
-        }
-        return res.status(401).json({
-          error: 'Incorrect PIN.',
-          pinRequired: true,
-          attemptsRemaining: MAX_FAILED_ATTEMPTS - failedPinAttempts
-        });
-      }
-      if (teacher.failedPinAttempts) {
-        teacher = await Teacher.findByIdAndUpdate(teacher._id, { failedPinAttempts: 0 }, { new: true });
-      }
+      teacher = await Teacher.create({
+        school: school._id,
+        staffId,
+        name,
+        source: 'checkin',
+        deviceTokenHash,
+        deviceBoundAt: new Date()
+      });
     }
-    // --- End PIN check ------------------------------------------------------
-
-    // --- Recognized-device signal -------------------------------------------
-    // Soft companion to the PIN (see utils/device.js): flags a record when
-    // the correct PIN came from a browser we haven't seen succeed before,
-    // without blocking it — this token is easy to lose honestly (private
-    // browsing, a cleared cache, a new phone), so it's evidence for an
-    // admin to review, not grounds to reject a check-in/out outright.
-    const deviceToken = String(req.body.deviceToken || '').trim();
-    const { deviceTokens, newDevice } = recognizeDevice(teacher.deviceTokens, deviceToken);
-    teacher = await Teacher.findByIdAndUpdate(teacher._id, { deviceTokens }, { new: true });
-    // --- End recognized-device signal ---------------------------------------
+    // --- End device binding ----------------------------------------------
 
     const at = new Date();
     let record;
@@ -245,7 +193,6 @@ router.post('/schools/:id/attendance', async (req, res, next) => {
         verified: wasOnRoster,
         distanceM,
         flagged: false,
-        newDevice,
         lat: STORE_PRECISE_LOCATION ? lat : null,
         lng: STORE_PRECISE_LOCATION ? lng : null,
         at,
@@ -265,8 +212,7 @@ router.post('/schools/:id/attendance', async (req, res, next) => {
       name: record.name,
       verified: record.verified,
       distanceM: record.distanceM,
-      flagged: record.flagged,
-      newDevice: record.newDevice
+      flagged: record.flagged
     });
   } catch (err) {
     next(err);

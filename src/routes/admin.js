@@ -210,19 +210,18 @@ router.delete('/teachers/:id', async (req, res, next) => {
 });
 
 /**
- * POST /teachers/:id/reset-pin — admin-only escape hatch for a teacher who
- * forgot their PIN, or a suspected-shared PIN that needs to stop working.
- * Clears the PIN, any lockout, AND the recognized-device list — a fresh
- * PIN going forward means a fresh set of "who's actually used it" too, same
- * as a brand-new staff ID. Deliberately admin-authenticated only — no
- * public "forgot PIN" flow, since anyone able to trigger that would defeat
- * the whole point of the PIN.
+ * POST /teachers/:id/reset-device — admin-only escape hatch for a teacher
+ * whose trusted device is gone (new phone, factory reset, cleared browser
+ * data) or a suspected-shared device that needs to stop working. Clears the
+ * binding; the next check-in binds a fresh device, same as a brand-new
+ * staff ID. Deliberately admin-authenticated only — no public self-service
+ * flow, since anyone able to trigger that would defeat the whole point.
  */
-router.post('/teachers/:id/reset-pin', async (req, res, next) => {
+router.post('/teachers/:id/reset-device', async (req, res, next) => {
   try {
     const teacher = await Teacher.findByIdAndUpdate(
       req.params.id,
-      { pinHash: null, failedPinAttempts: 0, pinLockedUntil: null, deviceTokens: [] },
+      { deviceTokenHash: null, deviceBoundAt: null },
       { new: true }
     );
     if (!teacher) return res.status(404).json({ error: 'Teacher not found.' });
@@ -317,9 +316,8 @@ function toTeacherJSON(t) {
     classTeaching: t.classTeaching || '',
     association: t.association || '',
     phoneNumber: t.phoneNumber || '',
-    hasPin: !!t.pinHash,
-    pinLocked: !!(t.pinLockedUntil && new Date(t.pinLockedUntil).getTime() > Date.now()),
-    deviceCount: Array.isArray(t.deviceTokens) ? t.deviceTokens.length : 0
+    deviceBound: !!t.deviceTokenHash,
+    deviceBoundAt: t.deviceBoundAt || null
   };
 }
 
@@ -332,7 +330,6 @@ function buildRecordFilter(query) {
   if (query.staffId) filter.staffId = String(query.staffId).trim().toUpperCase();
   if (query.flagged === 'true') filter.flagged = true;
   if (query.verified === 'false') filter.verified = false;
-  if (query.newDevice === 'true') filter.newDevice = true;
   return filter;
 }
 
@@ -378,7 +375,7 @@ router.get('/records/export', async (req, res, next) => {
     const filter = buildRecordFilter(req.query);
     const records = await Attendance.find(filter).sort({ at: -1 }).populate('school', 'name').lean();
 
-    const header = ['Date', 'Time', 'School', 'Teacher Name', 'Staff ID', 'Type', 'Verified', 'Distance (m)', 'Flagged', 'New Device'];
+    const header = ['Date', 'Time', 'School', 'Teacher Name', 'Staff ID', 'Type', 'Verified', 'Distance (m)', 'Flagged'];
     const rows = [header, ...records.map((r) => [
       r.dateKey,
       new Date(r.at).toISOString(),
@@ -388,8 +385,7 @@ router.get('/records/export', async (req, res, next) => {
       r.type === 'in' ? 'Check-in' : 'Check-out',
       r.verified ? 'Yes' : 'No',
       r.distanceM ?? '',
-      r.flagged ? 'Yes' : 'No',
-      r.newDevice ? 'Yes' : 'No'
+      r.flagged ? 'Yes' : 'No'
     ])];
 
     const csv = toCSV(rows);
@@ -412,7 +408,6 @@ function toRecordJSON(r) {
     verified: r.verified,
     distanceM: r.distanceM,
     flagged: r.flagged,
-    newDevice: !!r.newDevice,
     at: r.at,
     dateKey: r.dateKey
   };

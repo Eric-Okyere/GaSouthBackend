@@ -21,12 +21,6 @@ const attendanceSchema = new mongoose.Schema(
     distanceM: { type: Number, default: null },
     flagged: { type: Boolean, default: false },
 
-    // True when this check-in/out's PIN was correct but came from a browser
-    // we haven't seen succeed with this staff ID's PIN before (see
-    // utils/device.js). A soft signal, not a rejection — surfaced to admins
-    // in Records so a pattern (or a one-off phone upgrade) is visible.
-    newDevice: { type: Boolean, default: false },
-
     // Only populated when STORE_PRECISE_LOCATION=true — see .env.example.
     lat: { type: Number, default: null },
     lng: { type: Number, default: null },
