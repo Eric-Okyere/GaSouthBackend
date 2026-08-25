@@ -3,6 +3,15 @@ const mongoose = require('mongoose');
 const School = require('../models/School');
 const Teacher = require('../models/Teacher');
 
+// Note on the PIN feature: registration deliberately never sets or touches
+// pinHash. This form has no authentication and upserts purely on
+// {school, staffId} — both of which a colleague could type in on a
+// teacher's behalf just as easily as their own. If re-submitting this form
+// could set someone's PIN, it would reopen exactly the impersonation gap
+// the PIN exists to close. A teacher's PIN is only ever created or checked
+// from the check-in flow itself (see routes/public.js), which is the one
+// place a person has to actually be present to use.
+
 const router = express.Router();
 
 // Shown as preset choices on the registration form; a teacher can still type

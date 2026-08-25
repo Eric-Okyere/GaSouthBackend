@@ -19,4 +19,31 @@ function dayBounds(dateString) {
   return { start, end };
 }
 
-module.exports = { TZ, dateStr, dayBounds };
+function isWeekend(dateString) {
+  const day = new Date(dateString + 'T00:00:00.000Z').getUTCDay(); // 0=Sun, 6=Sat
+  return day === 0 || day === 6;
+}
+
+/** Every 'YYYY-MM-DD' from start to end (inclusive), for present/absent
+ *  counting. Weekends are dropped by default — schools aren't normally in
+ *  session then, so an unmarked Saturday shouldn't count as an absence. */
+function daysBetween(startStr, endStr, { excludeWeekends = true } = {}) {
+  const out = [];
+  let cur = new Date(startStr + 'T00:00:00.000Z');
+  const endD = new Date(endStr + 'T00:00:00.000Z');
+  while (cur.getTime() <= endD.getTime()) {
+    const s = dateStr(cur);
+    if (!excludeWeekends || !isWeekend(s)) out.push(s);
+    cur = new Date(cur.getTime() + 24 * 60 * 60 * 1000);
+  }
+  return out;
+}
+
+/** 'YYYY-MM-DD' for the 1st of the month containing `dateString` (today's
+ *  district date by default) — the default start of an attendance summary
+ *  range when the caller doesn't pick one. */
+function startOfMonthStr(dateString = dateStr()) {
+  return dateString.slice(0, 7) + '-01';
+}
+
+module.exports = { TZ, dateStr, dayBounds, isWeekend, daysBetween, startOfMonthStr };

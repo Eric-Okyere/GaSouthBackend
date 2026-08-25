@@ -40,32 +40,39 @@ function createApp() {
     app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
   }
 
-  const loginLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    limit: 20,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: 'Too many attempts. Please wait a while and try again.' }
-  });
-  app.use('/api/admin/auth/login', loginLimiter);
+  // Skipped under the test suite: supertest requests all arrive from the
+  // same address, so a real integration test run (hundreds of requests
+  // exercising login, check-in, and registration across many cases) trips
+  // these anti-abuse limits on request volume alone, not real abuse. The
+  // limits themselves stay unchanged for every real deployment.
+  if (process.env.NODE_ENV !== 'test') {
+    const loginLimiter = rateLimit({
+      windowMs: 15 * 60 * 1000,
+      limit: 20,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: 'Too many attempts. Please wait a while and try again.' }
+    });
+    app.use('/api/admin/auth/login', loginLimiter);
 
-  const attendanceLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    limit: 30,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: 'Too many requests. Please wait a moment and try again.' }
-  });
-  app.use('/api/schools/:id/attendance', attendanceLimiter);
+    const attendanceLimiter = rateLimit({
+      windowMs: 60 * 1000,
+      limit: 30,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: 'Too many requests. Please wait a moment and try again.' }
+    });
+    app.use('/api/schools/:id/attendance', attendanceLimiter);
 
-  const registerLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    limit: 10,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: 'Too many requests. Please wait a moment and try again.' }
-  });
-  app.use('/api/register', registerLimiter);
+    const registerLimiter = rateLimit({
+      windowMs: 60 * 1000,
+      limit: 10,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: 'Too many requests. Please wait a moment and try again.' }
+    });
+    app.use('/api/register', registerLimiter);
+  }
 
   app.get('/api/health', (req, res) => res.json({ ok: true }));
   app.use('/api', publicRoutes);

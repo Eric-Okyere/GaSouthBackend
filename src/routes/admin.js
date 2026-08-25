@@ -4,7 +4,7 @@ const Teacher = require('../models/Teacher');
 const Attendance = require('../models/Attendance');
 const { requireAdmin } = require('../middleware/auth');
 const { toCSV } = require('../utils/csv');
-const { dateStr, dayBounds } = require('../utils/time');
+const { dateStr, dayBounds, daysBetween, startOfMonthStr } = require('../utils/time');
 
 const router = express.Router();
 router.use(requireAdmin);
@@ -209,6 +209,102 @@ router.delete('/teachers/:id', async (req, res, next) => {
   }
 });
 
+/**
+ * POST /teachers/:id/reset-pin — admin-only escape hatch for a teacher who
+ * forgot their PIN, or a suspected-shared PIN that needs to stop working.
+ * Clears the PIN, any lockout, AND the recognized-device list — a fresh
+ * PIN going forward means a fresh set of "who's actually used it" too, same
+ * as a brand-new staff ID. Deliberately admin-authenticated only — no
+ * public "forgot PIN" flow, since anyone able to trigger that would defeat
+ * the whole point of the PIN.
+ */
+router.post('/teachers/:id/reset-pin', async (req, res, next) => {
+  try {
+    const teacher = await Teacher.findByIdAndUpdate(
+      req.params.id,
+      { pinHash: null, failedPinAttempts: 0, pinLockedUntil: null, deviceTokens: [] },
+      { new: true }
+    );
+    if (!teacher) return res.status(404).json({ error: 'Teacher not found.' });
+    res.json(toTeacherJSON(teacher));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** GET /schools/:id/totals — all-time check-in/check-out counts for one school. */
+router.get('/schools/:id/totals', async (req, res, next) => {
+  try {
+    const school = await School.findById(req.params.id).lean();
+    if (!school) return res.status(404).json({ error: 'School not found.' });
+
+    const [checkins, checkouts] = await Promise.all([
+      Attendance.countDocuments({ school: school._id, type: 'in' }),
+      Attendance.countDocuments({ school: school._id, type: 'out' })
+    ]);
+    res.json({ checkins, checkouts });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /schools/:id/attendance-summary?start=&end= — present/absent counts
+ * per active roster teacher over a date range (default: this month so far).
+ * "Present" = at least one check-in that day; "absent" = a school day with
+ * none. Weekends are excluded (schools aren't normally in session). A
+ * teacher's count only starts from whichever is later: the range start, or
+ * the day they joined the roster — so a teacher added mid-month isn't shown
+ * absent for days before they existed.
+ */
+router.get('/schools/:id/attendance-summary', async (req, res, next) => {
+  try {
+    const school = await School.findById(req.params.id).lean();
+    if (!school) return res.status(404).json({ error: 'School not found.' });
+
+    const today = dateStr();
+    const start = req.query.start || startOfMonthStr(today);
+    const end = req.query.end && req.query.end < today ? req.query.end : today; // never count into the future
+    if (start > end) return res.status(400).json({ error: 'start must be on or before end.' });
+
+    const [teachers, checkinRows] = await Promise.all([
+      Teacher.find({ school: school._id, active: true }).sort({ name: 1 }).lean(),
+      Attendance.find({ school: school._id, type: 'in', dateKey: { $gte: start, $lte: end } })
+        .select('staffId dateKey')
+        .lean()
+    ]);
+
+    const presentDays = new Map(); // staffId -> Set of dateKey
+    for (const r of checkinRows) {
+      if (!presentDays.has(r.staffId)) presentDays.set(r.staffId, new Set());
+      presentDays.get(r.staffId).add(r.dateKey);
+    }
+
+    const allDays = daysBetween(start, end, { excludeWeekends: true });
+
+    const summary = teachers.map((t) => {
+      const joined = t.createdAt ? dateStr(new Date(t.createdAt)) : start;
+      const effectiveStart = joined > start ? joined : start;
+      const days = allDays.filter((d) => d >= effectiveStart);
+      const present = presentDays.get(t.staffId) || new Set();
+      const presentCount = days.filter((d) => present.has(d)).length;
+      return {
+        id: t._id,
+        staffId: t.staffId,
+        name: t.name,
+        phoneNumber: t.phoneNumber || '',
+        totalSchoolDays: days.length,
+        presentDays: presentCount,
+        absentDays: days.length - presentCount
+      };
+    });
+
+    res.json({ school: { id: school._id, name: school.name }, start, end, teachers: summary });
+  } catch (err) {
+    next(err);
+  }
+});
+
 function toTeacherJSON(t) {
   return {
     id: t._id,
@@ -220,7 +316,10 @@ function toTeacherJSON(t) {
     dateOfBirth: t.dateOfBirth || null,
     classTeaching: t.classTeaching || '',
     association: t.association || '',
-    phoneNumber: t.phoneNumber || ''
+    phoneNumber: t.phoneNumber || '',
+    hasPin: !!t.pinHash,
+    pinLocked: !!(t.pinLockedUntil && new Date(t.pinLockedUntil).getTime() > Date.now()),
+    deviceCount: Array.isArray(t.deviceTokens) ? t.deviceTokens.length : 0
   };
 }
 
@@ -230,8 +329,10 @@ function buildRecordFilter(query) {
   const filter = {};
   if (query.school) filter.school = query.school;
   if (query.date) filter.dateKey = query.date;
+  if (query.staffId) filter.staffId = String(query.staffId).trim().toUpperCase();
   if (query.flagged === 'true') filter.flagged = true;
   if (query.verified === 'false') filter.verified = false;
+  if (query.newDevice === 'true') filter.newDevice = true;
   return filter;
 }
 
@@ -277,7 +378,7 @@ router.get('/records/export', async (req, res, next) => {
     const filter = buildRecordFilter(req.query);
     const records = await Attendance.find(filter).sort({ at: -1 }).populate('school', 'name').lean();
 
-    const header = ['Date', 'Time', 'School', 'Teacher Name', 'Staff ID', 'Type', 'Verified', 'Distance (m)', 'Flagged'];
+    const header = ['Date', 'Time', 'School', 'Teacher Name', 'Staff ID', 'Type', 'Verified', 'Distance (m)', 'Flagged', 'New Device'];
     const rows = [header, ...records.map((r) => [
       r.dateKey,
       new Date(r.at).toISOString(),
@@ -287,7 +388,8 @@ router.get('/records/export', async (req, res, next) => {
       r.type === 'in' ? 'Check-in' : 'Check-out',
       r.verified ? 'Yes' : 'No',
       r.distanceM ?? '',
-      r.flagged ? 'Yes' : 'No'
+      r.flagged ? 'Yes' : 'No',
+      r.newDevice ? 'Yes' : 'No'
     ])];
 
     const csv = toCSV(rows);
@@ -310,10 +412,54 @@ function toRecordJSON(r) {
     verified: r.verified,
     distanceM: r.distanceM,
     flagged: r.flagged,
+    newDevice: !!r.newDevice,
     at: r.at,
     dateKey: r.dateKey
   };
 }
+
+/**
+ * GET /open-checkins?date=&school= — teachers checked IN on `date` (default
+ * today) who have no matching check-OUT yet. Click-through target: pair
+ * each row with /admin/records?school=&staffId= to see that person's records.
+ */
+router.get('/open-checkins', async (req, res, next) => {
+  try {
+    const date = req.query.date || dateStr();
+    const filter = { type: 'in', dateKey: date };
+    if (req.query.school) filter.school = req.query.school;
+
+    const ins = await Attendance.find(filter).sort({ at: 1 }).populate('school', 'name').lean();
+    if (!ins.length) return res.json({ date, openCheckins: [] });
+
+    const outFilter = { type: 'out', dateKey: date };
+    if (req.query.school) outFilter.school = req.query.school;
+    const outs = await Attendance.find(outFilter).lean();
+    const checkedOut = new Set(outs.map((o) => `${o.school}|${o.staffId}`));
+
+    const stillIn = ins.filter((r) => !checkedOut.has(`${r.school ? r.school._id : r.school}|${r.staffId}`));
+
+    // Enrich with a phone number from the roster where one's on file, so
+    // the admin can call/WhatsApp straight from this list.
+    const teachers = stillIn.length
+      ? await Teacher.find({ staffId: { $in: stillIn.map((r) => r.staffId) } }).select('school staffId phoneNumber').lean()
+      : [];
+    const phoneByKey = new Map(teachers.map((t) => [`${t.school}|${t.staffId}`, t.phoneNumber || '']));
+
+    const openCheckins = stillIn.map((r) => ({
+      id: r._id,
+      school: r.school ? { id: r.school._id, name: r.school.name } : null,
+      staffId: r.staffId,
+      name: r.name,
+      checkedInAt: r.at,
+      phoneNumber: phoneByKey.get(`${r.school ? r.school._id : r.school}|${r.staffId}`) || ''
+    }));
+
+    res.json({ date, openCheckins });
+  } catch (err) {
+    next(err);
+  }
+});
 
 /* ------------------------------- Stats ------------------------------- */
 
