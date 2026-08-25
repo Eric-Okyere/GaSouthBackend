@@ -57,6 +57,26 @@ router.get('/schools/:id/status', async (req, res, next) => {
 
     const teacher = await Teacher.findOne({ school: school._id, staffId, active: true }).lean();
 
+    if (!teacher) {
+      // Not registered at THIS school. Check whether the staff ID is
+      // registered anywhere else, so the check-in page can tell the
+      // difference between "you haven't registered at all" and "you scanned
+      // the wrong school's QR code" — without naming the other school here
+      // (this is a public, unauthenticated endpoint).
+      const others = await Teacher.find({ staffId, active: true }).lean();
+      const wrongSchool = others.some((t) => String(t.school) !== String(school._id));
+      return res.json({
+        staffId,
+        registered: false,
+        wrongSchool,
+        verifiedName: null,
+        next: 'in',
+        checkedInAt: null,
+        checkedOutAt: null,
+        deviceBound: false
+      });
+    }
+
     const today = dateStr();
     const [checkIn, checkOut] = await Promise.all([
       Attendance.findOne({ school: school._id, staffId, type: 'in', dateKey: today }).lean(),
@@ -68,11 +88,13 @@ router.get('/schools/:id/status', async (req, res, next) => {
     // deviceBound tells the check-in page whether this staff ID already has
     // a trusted device on file. If not, this check-in is the one that
     // establishes it — worth a friendly one-time note on the frontend.
-    const deviceBound = !!(teacher && teacher.deviceTokenHash);
+    const deviceBound = !!teacher.deviceTokenHash;
 
     res.json({
       staffId,
-      verifiedName: teacher ? teacher.name : null,
+      registered: true,
+      wrongSchool: false,
+      verifiedName: teacher.name,
       next: next_,
       checkedInAt: checkIn ? checkIn.at : null,
       checkedOutAt: checkOut ? checkOut.at : null,
@@ -92,16 +114,33 @@ router.post('/schools/:id/attendance', async (req, res, next) => {
     const staffId = String(req.body.staffId || '').trim().toUpperCase();
     if (!staffId) return res.status(400).json({ error: 'Staff ID is required.' });
 
+    // --- Registration required, scoped to THIS school -----------------------
+    // A staff ID must already be on this specific school's roster before it
+    // can check in/out — no more creating a roster entry on the fly from a
+    // typed name. This is also what stops a teacher registered at one school
+    // from checking in at another: the lookup below is scoped to `school`,
+    // so a staff ID that only exists at a different school simply isn't
+    // found here, same as if it didn't exist anywhere.
     let teacher = await Teacher.findOne({ school: school._id, staffId, active: true });
-    // Recorded on the Attendance row below as `verified` — was this staff ID
-    // already on the roster *before* this request, as opposed to a roster
-    // entry the device-binding step below is about to create on the fly.
-    const wasOnRoster = !!teacher;
-    const typedName = String(req.body.name || '').trim();
-    if (!teacher && !typedName) {
-      return res.status(400).json({ error: 'Name is required.' });
+    if (!teacher) {
+      // Distinguish "not registered anywhere" from "registered, but at a
+      // different school" for a clearer message — without naming the other
+      // school (this is a public, unauthenticated endpoint).
+      const others = await Teacher.find({ staffId, active: true }).lean();
+      const wrongSchool = others.some((t) => String(t.school) !== String(school._id));
+      if (wrongSchool) {
+        return res.status(403).json({
+          error: 'This staff ID is registered at a different school. Please scan the QR code for your own school.',
+          wrongSchool: true
+        });
+      }
+      return res.status(404).json({
+        error: 'This staff ID is not registered yet. Please register first, then come back and check in.',
+        notRegistered: true
+      });
     }
-    const name = teacher ? teacher.name : typedName;
+    const name = teacher.name;
+    // --- End registration check ----------------------------------------------
 
     const today = dateStr();
     const [checkIn, checkOut] = await Promise.all([
@@ -156,28 +195,19 @@ router.post('/schools/:id/attendance', async (req, res, next) => {
     }
     const deviceTokenHash = hashDeviceToken(deviceToken);
 
-    if (teacher && teacher.deviceTokenHash) {
+    if (teacher.deviceTokenHash) {
       if (teacher.deviceTokenHash !== deviceTokenHash) {
         return res.status(403).json({
           error: 'This device isn’t recognized for this staff ID. Please check in from the device you first used, or ask your school admin to reset your device.',
           deviceMismatch: true
         });
       }
-    } else if (teacher) {
+    } else {
       teacher = await Teacher.findByIdAndUpdate(
         teacher._id,
         { deviceTokenHash, deviceBoundAt: new Date() },
         { new: true }
       );
-    } else {
-      teacher = await Teacher.create({
-        school: school._id,
-        staffId,
-        name,
-        source: 'checkin',
-        deviceTokenHash,
-        deviceBoundAt: new Date()
-      });
     }
     // --- End device binding ----------------------------------------------
 
@@ -186,11 +216,15 @@ router.post('/schools/:id/attendance', async (req, res, next) => {
     try {
       record = await Attendance.create({
         school: school._id,
-        teacher: teacher ? teacher._id : null,
+        teacher: teacher._id,
         staffId,
         name,
         type,
-        verified: wasOnRoster,
+        // Always true now — a check-in/out can't happen at all unless the
+        // staff ID is already on this school's roster (see the registration
+        // check above). The field is kept for continuity with historical
+        // records from before registration was required.
+        verified: true,
         distanceM,
         flagged: false,
         lat: STORE_PRECISE_LOCATION ? lat : null,

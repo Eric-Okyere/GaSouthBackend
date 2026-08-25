@@ -1,9 +1,12 @@
 const mongoose = require('mongoose');
 
-// A school's teacher roster. Optional in the sense that check-in still works
-// for a staff ID with no roster entry (recorded as "unverified"), but a
-// roster entry lets the server confirm the teacher's real name instead of
-// trusting whatever was typed, and lets an admin see who hasn't shown up.
+// A school's teacher roster. A roster entry — scoped to one specific school
+// — is now required before that staff ID can check in/out at all: it's what
+// lets the server confirm the teacher's real name instead of trusting
+// whatever was typed, and, just as importantly, it's what proves a staff ID
+// belongs to the school whose QR code was scanned (see routes/public.js —
+// a staff ID registered at School A is rejected at School B's check-in,
+// never silently accepted).
 //
 // Entries get here two ways: an admin adds them directly (staffId + name
 // only, `source: 'admin'`), or a teacher fills in the public self-registration
@@ -17,8 +20,10 @@ const teacherSchema = new mongoose.Schema(
     staffId: { type: String, required: true, trim: true, uppercase: true },
     name: { type: String, required: true, trim: true },
     active: { type: Boolean, default: true },
-    // 'checkin' = the roster entry didn't exist yet and was created
-    // automatically the first time this staff ID checked in and bound a device.
+    // 'checkin' is legacy-only — earlier versions of this app auto-created a
+    // roster entry the first time an unregistered staff ID checked in. That
+    // path no longer exists (registration is required up front now), so no
+    // new entry will ever get this value, but old records may still have it.
     source: { type: String, enum: ['admin', 'self', 'checkin'], default: 'admin' },
     // Everything below is optional — only ever populated via self-registration.
     dateOfBirth: { type: Date, default: null },

@@ -304,6 +304,49 @@ router.get('/schools/:id/attendance-summary', async (req, res, next) => {
   }
 });
 
+/**
+ * GET /schools/:id/roster-status?date= — every active roster teacher at
+ * this school, split into who's checked in on `date` (default today) and
+ * who hasn't — so an admin can see at a glance who to follow up with, and
+ * reach them directly (phone number included where on file). Unlike
+ * attendance-summary (a range, "present days" counted), this is a single
+ * day's yes/no split with the actual check-in/out times — the tool for
+ * "who's missing today", not historical trends.
+ */
+router.get('/schools/:id/roster-status', async (req, res, next) => {
+  try {
+    const school = await School.findById(req.params.id).lean();
+    if (!school) return res.status(404).json({ error: 'School not found.' });
+
+    const date = req.query.date || dateStr();
+
+    const [teachers, ins, outs] = await Promise.all([
+      Teacher.find({ school: school._id, active: true }).sort({ name: 1 }).lean(),
+      Attendance.find({ school: school._id, type: 'in', dateKey: date }).select('staffId at').lean(),
+      Attendance.find({ school: school._id, type: 'out', dateKey: date }).select('staffId at').lean()
+    ]);
+
+    const checkInAtByStaffId = new Map(ins.map((r) => [r.staffId, r.at]));
+    const checkOutAtByStaffId = new Map(outs.map((r) => [r.staffId, r.at]));
+
+    const checkedIn = [];
+    const notCheckedIn = [];
+    for (const t of teachers) {
+      const checkedInAt = checkInAtByStaffId.get(t.staffId);
+      const base = { id: t._id, staffId: t.staffId, name: t.name, phoneNumber: t.phoneNumber || '' };
+      if (checkedInAt) {
+        checkedIn.push({ ...base, checkedInAt, checkedOutAt: checkOutAtByStaffId.get(t.staffId) || null });
+      } else {
+        notCheckedIn.push(base);
+      }
+    }
+
+    res.json({ school: { id: school._id, name: school.name }, date, checkedIn, notCheckedIn });
+  } catch (err) {
+    next(err);
+  }
+});
+
 function toTeacherJSON(t) {
   return {
     id: t._id,
