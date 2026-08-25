@@ -183,14 +183,48 @@ router.post('/schools/:id/teachers/bulk', async (req, res, next) => {
   }
 });
 
+// A teacher may have mistyped something on self-registration (or an admin
+// may just have better information later) — this lets an admin correct any
+// of the fields the registration form collects, not just the two originally
+// supported here. Same validation idiom as POST /api/register: required
+// fields reject empty, dateOfBirth is parsed and range-checked, everything
+// else is free text trimmed as-is (an empty string clears it back to the
+// schema default rather than being rejected, since these are all optional
+// on the model).
 router.patch('/teachers/:id', async (req, res, next) => {
   try {
     const update = {};
-    if (typeof req.body.name === 'string') update.name = req.body.name.trim();
-    if (typeof req.body.staffId === 'string') update.staffId = req.body.staffId.trim().toUpperCase();
-    if (typeof req.body.active === 'boolean') update.active = req.body.active;
+    const body = req.body || {};
 
-    const teacher = await Teacher.findByIdAndUpdate(req.params.id, update, { new: true });
+    if (typeof body.name === 'string') {
+      const name = body.name.trim();
+      if (!name) return res.status(400).json({ error: 'Name cannot be empty.' });
+      update.name = name;
+    }
+    if (typeof body.staffId === 'string') {
+      const staffId = body.staffId.trim().toUpperCase();
+      if (!staffId) return res.status(400).json({ error: 'Staff ID cannot be empty.' });
+      update.staffId = staffId;
+    }
+    if (typeof body.active === 'boolean') update.active = body.active;
+
+    if (typeof body.dateOfBirth === 'string') {
+      const raw = body.dateOfBirth.trim();
+      if (!raw) {
+        update.dateOfBirth = null;
+      } else {
+        const dateOfBirth = new Date(raw);
+        if (Number.isNaN(dateOfBirth.getTime())) {
+          return res.status(400).json({ error: 'Date of birth is not a valid date.' });
+        }
+        update.dateOfBirth = dateOfBirth;
+      }
+    }
+    if (typeof body.classTeaching === 'string') update.classTeaching = body.classTeaching.trim();
+    if (typeof body.association === 'string') update.association = body.association.trim();
+    if (typeof body.phoneNumber === 'string') update.phoneNumber = body.phoneNumber.trim();
+
+    const teacher = await Teacher.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true });
     if (!teacher) return res.status(404).json({ error: 'Teacher not found.' });
     res.json(toTeacherJSON(teacher));
   } catch (err) {
