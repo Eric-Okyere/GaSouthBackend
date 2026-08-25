@@ -367,17 +367,93 @@ function toTeacherJSON(t) {
 /* ------------------------------- District-wide teacher directory ------------------------------- */
 
 /**
- * GET /teachers — every teacher in the district, at every school, active or
- * not, with the school's name attached — the data behind the district-wide
- * Teachers page (sort/search client-side, click through to one teacher's
- * detail). Deliberately unpaginated, same reasoning as the school directory:
- * a district's whole roster is small enough to sort and search in the
- * browser without round-tripping to the server on every keystroke.
+ * Every 'in'/'out' Attendance row for the whole district on one day, keyed
+ * by `school|staffId` — the shared lookup behind the directory's optional
+ * present/absent column and its CSV export, so both compute it the same way
+ * instead of drifting. One query per type, not one per teacher.
+ */
+async function loadDistrictDayStatus(date) {
+  const [ins, outs] = await Promise.all([
+    Attendance.find({ type: 'in', dateKey: date }).select('school staffId at').lean(),
+    Attendance.find({ type: 'out', dateKey: date }).select('school staffId at').lean()
+  ]);
+  return {
+    date,
+    inMap: new Map(ins.map((r) => [`${r.school}|${r.staffId}`, r.at])),
+    outMap: new Map(outs.map((r) => [`${r.school}|${r.staffId}`, r.at]))
+  };
+}
+
+/**
+ * GET /teachers?school=&date= — every teacher in the district, at every
+ * school, active or not, with the school's name attached — the data behind
+ * the district-wide Teachers page (sort/search client-side, click through to
+ * one teacher's detail). `school` narrows it to one school (an exact filter,
+ * distinct from the page's free-text search); `date` attaches that day's
+ * check-in/out status to each teacher (default omitted — the plain roster,
+ * no status computed) so the page can show "who was here" for a single day
+ * without a request per teacher. Deliberately unpaginated, same reasoning as
+ * the school directory: a district's whole roster is small enough to sort
+ * and search in the browser without round-tripping on every keystroke.
  */
 router.get('/teachers', async (req, res, next) => {
   try {
-    const teachers = await Teacher.find().sort({ name: 1 }).populate('school', 'name').lean();
-    res.json(teachers.map(toDirectoryTeacherJSON));
+    const filter = {};
+    if (req.query.school) filter.school = req.query.school;
+    const teachers = await Teacher.find(filter).sort({ name: 1 }).populate('school', 'name').lean();
+
+    const status = req.query.date ? await loadDistrictDayStatus(req.query.date) : null;
+    res.json(teachers.map((t) => toDirectoryTeacherJSON(t, status)));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /teachers/export?school=&date= — the district directory as a CSV,
+ * respecting the same `school` and `date` filters as the page above, so
+ * "export what I'm looking at" does exactly that. Registered before
+ * `/teachers/:id` so the literal path `/teachers/export` isn't swallowed by
+ * that route's `:id` param.
+ */
+router.get('/teachers/export', async (req, res, next) => {
+  try {
+    const filter = {};
+    if (req.query.school) filter.school = req.query.school;
+    const teachers = await Teacher.find(filter).sort({ name: 1 }).populate('school', 'name').lean();
+
+    const date = req.query.date;
+    const status = date ? await loadDistrictDayStatus(date) : null;
+
+    const header = ['Name', 'Staff ID', 'School', 'Active', 'Class Teaching', 'Association', 'Phone', 'Source', 'Device Bound'];
+    if (date) header.push('Status', 'Checked In At', 'Checked Out At');
+
+    const rows = [header, ...teachers.map((t) => {
+      const row = [
+        t.name,
+        t.staffId,
+        t.school ? t.school.name : '',
+        t.active ? 'Yes' : 'No',
+        t.classTeaching || '',
+        t.association || '',
+        t.phoneNumber || '',
+        t.source === 'self' ? 'Self-registered' : 'Admin-added',
+        t.deviceTokenHash ? 'Yes' : 'No'
+      ];
+      if (date) {
+        const key = `${t.school ? t.school._id : t.school}|${t.staffId}`;
+        const checkedInAt = status.inMap.get(key);
+        const checkedOutAt = status.outMap.get(key);
+        row.push(checkedInAt ? 'Present' : 'Absent', checkedInAt ? new Date(checkedInAt).toISOString() : '', checkedOutAt ? new Date(checkedOutAt).toISOString() : '');
+      }
+      return row;
+    })];
+
+    const csv = toCSV(rows);
+    const filename = `ga-south-teachers${date ? '-' + date : ''}.csv`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
   } catch (err) {
     next(err);
   }
@@ -434,8 +510,8 @@ router.get('/teachers/:id', async (req, res, next) => {
   }
 });
 
-function toDirectoryTeacherJSON(t) {
-  return {
+function toDirectoryTeacherJSON(t, status) {
+  const json = {
     id: t._id,
     staffId: t.staffId,
     name: t.name,
@@ -449,6 +525,15 @@ function toDirectoryTeacherJSON(t) {
     deviceBound: !!t.deviceTokenHash,
     deviceBoundAt: t.deviceBoundAt || null
   };
+  if (status) {
+    const key = `${t.school ? t.school._id : t.school}|${t.staffId}`;
+    json.attendanceStatus = {
+      date: status.date,
+      checkedInAt: status.inMap.get(key) || null,
+      checkedOutAt: status.outMap.get(key) || null
+    };
+  }
+  return json;
 }
 
 /* ------------------------------- Records ------------------------------- */
