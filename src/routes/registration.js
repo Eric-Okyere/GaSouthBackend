@@ -2,15 +2,24 @@ const express = require('express');
 const mongoose = require('mongoose');
 const School = require('../models/School');
 const Teacher = require('../models/Teacher');
+const { hashDeviceToken } = require('../utils/device');
 
-// Note on device binding: registration deliberately never sets or touches
-// deviceTokenHash. This form has no authentication and upserts purely on
-// {school, staffId} — both of which a colleague could type in on a
-// teacher's behalf just as easily as their own. If re-submitting this form
-// could bind a device, it would reopen exactly the impersonation gap device
-// binding exists to close. A teacher's device is only ever bound or checked
-// from the check-in flow itself (see routes/public.js), which is the one
-// place a person has to actually be present, using their own phone, to use.
+// Note on device binding: the phone a teacher registers from becomes their
+// trusted device, exactly like a first check-in used to (see
+// routes/public.js) — binding happens here, at registration, so a teacher
+// can never complete even one check-in from a phone that isn't theirs.
+//
+// It only ever binds ONCE per roster entry, on whichever submission is the
+// first to see no device on file yet — the entry's very first registration,
+// or a later self-registration for a staff ID an admin had added directly
+// (which never binds a device on its own). A resubmission once a device is
+// already bound never rebinds it: this form has no authentication and
+// upserts purely on {school, staffId} — both of which a colleague could
+// type in on a teacher's behalf just as easily as their own — so letting a
+// later resubmission move the binding would reopen exactly the
+// impersonation gap device binding exists to close. Every other field
+// (name, phone number, etc.) still updates normally on a resubmission;
+// only the device binding itself is left alone once set.
 
 const router = express.Router();
 
@@ -41,6 +50,7 @@ router.post('/register', async (req, res, next) => {
     const association = String(req.body.association || '').trim();
     const classTeaching = String(req.body.classTeaching || '').trim();
     const dateOfBirthRaw = String(req.body.dateOfBirth || '').trim();
+    const deviceToken = String(req.body.deviceToken || '').trim();
 
     const missing = [];
     if (!schoolId) missing.push('school');
@@ -65,19 +75,25 @@ router.post('/register', async (req, res, next) => {
     if (!school) return res.status(404).json({ error: 'Please choose a valid school.' });
 
     const existing = await Teacher.findOne({ school: school._id, staffId }).lean();
-    const teacher = await Teacher.findOneAndUpdate(
-      { school: school._id, staffId },
-      {
-        name,
-        active: true,
-        source: 'self',
-        dateOfBirth,
-        classTeaching,
-        association,
-        phoneNumber
-      },
-      { upsert: true, new: true }
-    );
+
+    const update = {
+      name,
+      active: true,
+      source: 'self',
+      dateOfBirth,
+      classTeaching,
+      association,
+      phoneNumber
+    };
+    // Bind the device only if nothing is bound yet (see the note above) —
+    // omitting these keys entirely when we don't intend to bind leaves
+    // whatever's already on the record untouched.
+    if (deviceToken && !(existing && existing.deviceTokenHash)) {
+      update.deviceTokenHash = hashDeviceToken(deviceToken);
+      update.deviceBoundAt = new Date();
+    }
+
+    const teacher = await Teacher.findOneAndUpdate({ school: school._id, staffId }, update, { upsert: true, new: true });
 
     res.status(existing ? 200 : 201).json({
       updated: !!existing,
