@@ -30,17 +30,17 @@ const teacherSchema = new mongoose.Schema(
     classTeaching: { type: String, trim: true, default: '' },
     association: { type: String, trim: true, default: '' },
     phoneNumber: { type: String, trim: true, default: '' },
-    // Anti-impersonation: the browser a teacher registers from becomes this
-    // staff ID's trusted device — every check-in/out after that must come
-    // from the same browser, or it's rejected outright (see
-    // routes/public.js and routes/registration.js). The staff ID alone
-    // can't prove identity, since it's printed on the school's public QR
-    // flyer for anyone to read; binding to the device that registered (or,
-    // for a roster entry an admin added directly with no registration
-    // step, the device that first checks in) is what does. Only the hash
-    // of the device token is ever stored, and it's set exactly once — the
-    // first submission that finds no device bound yet, whether that's a
-    // registration or a check-in.
+    // Anti-impersonation: the browser a teacher first checks in from becomes
+    // this staff ID's trusted device — every check-in/out after that must
+    // come from the same browser, or it's rejected outright (see
+    // routes/public.js). The staff ID alone can't prove identity, since it's
+    // printed on the school's public QR flyer for anyone to read; binding to
+    // the device that "logged in" first is what does. Only the hash of the
+    // device token is ever stored, and it's set only from the check-in flow
+    // itself (never from /register, which is meant to be fillable by anyone
+    // on a teacher's behalf and so can't reliably say which phone is
+    // actually theirs) — the one place a person has to actually be using
+    // their own phone to trigger.
     deviceTokenHash: { type: String, default: null },
     deviceBoundAt: { type: Date, default: null }
   },

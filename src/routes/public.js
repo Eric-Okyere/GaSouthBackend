@@ -186,17 +186,17 @@ router.post('/schools/:id/attendance', async (req, res, next) => {
     // --- Device binding ------------------------------------------------------
     // This is the anti-impersonation control: a staff ID printed on a
     // school's public QR flyer is not secret, so typing it can't prove who's
-    // actually standing there. Normally the device is already bound by now
-    // — registration binds the phone a teacher registered from (see
-    // routes/registration.js) — so this is mostly enforcement: every
-    // check-in/out must come from that same device, or it's rejected
-    // outright, nothing written. The bind-here branch below only ever fires
-    // for a roster entry that reached this point with no device bound yet —
-    // an admin added it directly and the teacher never self-registered — in
-    // which case this first check-in is what binds it, same as before
-    // device binding moved to registration. Deliberately checked only after
-    // the same-day-state and coverage checks above, so a request that was
-    // going to be rejected anyway never affects device binding.
+    // actually standing there. The first check-in for a staff ID ("logging
+    // in" for the first time) binds it to that browser; every check-in/out
+    // after that must come from the same device, or it's rejected outright
+    // — nothing is written. Registration deliberately never binds a device
+    // (see routes/registration.js — it's meant to be fillable by anyone on
+    // a teacher's behalf, so the phone used there proves nothing about
+    // which phone the teacher will actually check in from), so this first
+    // check-in is the one and only place binding happens for every teacher,
+    // not just a fallback case. Deliberately checked only after the
+    // same-day-state and coverage checks above, so a request that was going
+    // to be rejected anyway never affects device binding.
     const deviceToken = String(req.body.deviceToken || '').trim();
     if (!deviceToken) {
       return res.status(400).json({

@@ -2,24 +2,22 @@ const express = require('express');
 const mongoose = require('mongoose');
 const School = require('../models/School');
 const Teacher = require('../models/Teacher');
-const { hashDeviceToken } = require('../utils/device');
 
-// Note on device binding: the phone a teacher registers from becomes their
-// trusted device, exactly like a first check-in used to (see
-// routes/public.js) — binding happens here, at registration, so a teacher
-// can never complete even one check-in from a phone that isn't theirs.
-//
-// It only ever binds ONCE per roster entry, on whichever submission is the
-// first to see no device on file yet — the entry's very first registration,
-// or a later self-registration for a staff ID an admin had added directly
-// (which never binds a device on its own). A resubmission once a device is
-// already bound never rebinds it: this form has no authentication and
-// upserts purely on {school, staffId} — both of which a colleague could
-// type in on a teacher's behalf just as easily as their own — so letting a
-// later resubmission move the binding would reopen exactly the
-// impersonation gap device binding exists to close. Every other field
-// (name, phone number, etc.) still updates normally on a resubmission;
-// only the device binding itself is left alone once set.
+// Note on device binding: registration deliberately never sets or touches
+// deviceTokenHash. This form is meant to be fillable by anyone on a
+// teacher's behalf — an admin sitting at an office computer registering a
+// whole staff room at once is a normal, expected way to use it, not an edge
+// case — so the phone or computer used *here* says nothing reliable about
+// which phone the teacher will actually use to check in and out. Binding
+// that device would either lock every teacher registered this way out of
+// their own check-in (bound to the admin's device instead of theirs), or,
+// if bound loosely, let a colleague who knows a teacher's public staff ID
+// register on their behalf and hijack the binding. A device is only ever
+// bound or checked from the check-in flow itself (see routes/public.js) —
+// the one place a person has to actually be present, using their own
+// phone, to use. (This was tried the other way in round 17 and reverted in
+// round 19 after the office-registration case above turned out to be a
+// real, common workflow — see the project history for both rounds.)
 
 const router = express.Router();
 
@@ -50,7 +48,6 @@ router.post('/register', async (req, res, next) => {
     const association = String(req.body.association || '').trim();
     const classTeaching = String(req.body.classTeaching || '').trim();
     const dateOfBirthRaw = String(req.body.dateOfBirth || '').trim();
-    const deviceToken = String(req.body.deviceToken || '').trim();
 
     const missing = [];
     if (!schoolId) missing.push('school');
@@ -75,25 +72,19 @@ router.post('/register', async (req, res, next) => {
     if (!school) return res.status(404).json({ error: 'Please choose a valid school.' });
 
     const existing = await Teacher.findOne({ school: school._id, staffId }).lean();
-
-    const update = {
-      name,
-      active: true,
-      source: 'self',
-      dateOfBirth,
-      classTeaching,
-      association,
-      phoneNumber
-    };
-    // Bind the device only if nothing is bound yet (see the note above) —
-    // omitting these keys entirely when we don't intend to bind leaves
-    // whatever's already on the record untouched.
-    if (deviceToken && !(existing && existing.deviceTokenHash)) {
-      update.deviceTokenHash = hashDeviceToken(deviceToken);
-      update.deviceBoundAt = new Date();
-    }
-
-    const teacher = await Teacher.findOneAndUpdate({ school: school._id, staffId }, update, { upsert: true, new: true });
+    const teacher = await Teacher.findOneAndUpdate(
+      { school: school._id, staffId },
+      {
+        name,
+        active: true,
+        source: 'self',
+        dateOfBirth,
+        classTeaching,
+        association,
+        phoneNumber
+      },
+      { upsert: true, new: true }
+    );
 
     res.status(existing ? 200 : 201).json({
       updated: !!existing,
