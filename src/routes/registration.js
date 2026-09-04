@@ -36,9 +36,11 @@ router.get('/register/associations', (req, res) => {
  * POST /api/register — public teacher self-registration.
  * A teacher fills this in once (from a shared link/QR, not a per-school
  * one — they pick their school here). Writes to the same Teacher
- * collection/unique index as the admin roster: registering again with the
- * same staff ID at the same school updates that entry instead of creating
- * a duplicate, so a typo can be corrected by re-submitting.
+ * collection/unique index as the admin roster. Every staff ID may only
+ * ever be registered once: a second submission for a staff ID already on
+ * this school's roster is rejected outright (409), the same way the
+ * admin-add-one-teacher route already rejects a same-school duplicate —
+ * see below for why this no longer quietly updates the existing entry.
  */
 router.post('/register', async (req, res, next) => {
   try {
@@ -74,8 +76,6 @@ router.post('/register', async (req, res, next) => {
 
     // A staff ID already on file at a DIFFERENT school is a mistake to
     // catch here, not silently allow — see utils/teacherUniqueness.js.
-    // Registering again at the SAME school (a typo correction) is fine and
-    // handled below, unaffected by this check.
     if (await staffIdTakenElsewhere(Teacher, staffId, school._id)) {
       return res.status(409).json({
         error: 'This staff ID is already registered at a different school. If this teacher has transferred schools, ask the district admin to remove their old record first.',
@@ -83,10 +83,26 @@ router.post('/register', async (req, res, next) => {
       });
     }
 
-    const existing = await Teacher.findOne({ school: school._id, staffId }).lean();
-    const teacher = await Teacher.findOneAndUpdate(
-      { school: school._id, staffId },
-      {
+    // Every staff ID is unique to one person, so a second registration
+    // attempt for a staff ID already on THIS school's roster is rejected
+    // outright too, not silently applied as an update — previously this
+    // "corrected" the existing entry instead (a deliberate round-1 design,
+    // meant to let a typo be fixed by re-submitting), but a public,
+    // unauthenticated form that quietly overwrites whoever is already
+    // registered under a given staff ID is exactly the same kind of gap
+    // round 21's district-wide staff-ID uniqueness closed for a
+    // *different* school — this closes it for the *same* school too. A
+    // genuine mistake on file is now corrected by an admin, via Admin →
+    // Teachers → Edit, not by re-submitting this form. Race-safe: the
+    // actual guarantee is the `{school, staffId}` unique index below, not
+    // this check — two simultaneous first-time submissions for the same
+    // never-before-seen staff ID both pass it, and the index is what
+    // decides which one wins.
+    let teacher;
+    try {
+      teacher = await Teacher.create({
+        school: school._id,
+        staffId,
         name,
         active: true,
         source: 'self',
@@ -94,12 +110,19 @@ router.post('/register', async (req, res, next) => {
         classTeaching,
         association,
         phoneNumber
-      },
-      { upsert: true, new: true }
-    );
+      });
+    } catch (err) {
+      if (err.code === 11000) {
+        return res.status(409).json({
+          error: 'This staff ID is already registered. If any details need correcting, please ask your school admin to update them.',
+          alreadyRegistered: true
+        });
+      }
+      throw err;
+    }
 
-    res.status(existing ? 200 : 201).json({
-      updated: !!existing,
+    res.status(201).json({
+      updated: false,
       teacher: {
         id: teacher._id,
         school: teacher.school,
