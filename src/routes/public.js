@@ -3,7 +3,7 @@ const School = require('../models/School');
 const Teacher = require('../models/Teacher');
 const Attendance = require('../models/Attendance');
 const { distanceMeters } = require('../utils/geo');
-const { dateStr, dayBounds } = require('../utils/time');
+const { dateStr, dayBounds, isWeekend, arrivalStatus } = require('../utils/time');
 const { hashDeviceToken } = require('../utils/device');
 const { ensureCodesForList, codeOrIdFilter } = require('../utils/schoolCode');
 
@@ -120,6 +120,22 @@ router.post('/schools/:id/attendance', async (req, res, next) => {
     const staffId = String(req.body.staffId || '').trim().toUpperCase();
     if (!staffId) return res.status(400).json({ error: 'Staff ID is required.' });
 
+    // --- Weekdays only --------------------------------------------------------
+    // Schools aren't in session on Saturday/Sunday, so there's nothing to
+    // check in or out for — same "no school day" definition already used for
+    // present/absent counting (see utils/time.js's isWeekend/daysBetween).
+    // Deliberately the very first substantive check, ahead of even the
+    // registration lookup below: on a weekend the whole endpoint is closed
+    // for everyone, so there's no reason to spend a lookup (or leak whether
+    // a staff ID happens to be registered) before saying so.
+    const today = dateStr();
+    if (isWeekend(today)) {
+      return res.status(403).json({
+        error: 'Check-in and check-out are only available on school days (Monday to Friday). Please try again on the next school day.',
+        weekend: true
+      });
+    }
+
     // --- Registration required, scoped to THIS school -----------------------
     // A staff ID must already be on this specific school's roster before it
     // can check in/out — no more creating a roster entry on the fly from a
@@ -148,7 +164,6 @@ router.post('/schools/:id/attendance', async (req, res, next) => {
     const name = teacher.name;
     // --- End registration check ----------------------------------------------
 
-    const today = dateStr();
     const [checkIn, checkOut] = await Promise.all([
       Attendance.findOne({ school: school._id, staffId, type: 'in', dateKey: today }).lean(),
       Attendance.findOne({ school: school._id, staffId, type: 'out', dateKey: today }).lean()
@@ -162,11 +177,34 @@ router.post('/schools/:id/attendance', async (req, res, next) => {
     }
     const type = checkIn ? 'out' : 'in';
 
-    let distanceM = null;
-    let outOfCoverage = false;
+    // --- Location is now mandatory, not just used when available -----------
+    // A staff ID and a device token prove *who* is checking in/out, but
+    // nothing so far actually confirmed *where* — a teacher's location must
+    // be captured and, wherever the school has a GPS anchor to compare it
+    // against, checked before the request can proceed at all. The frontend
+    // already blocks submission client-side when the browser can't get a
+    // fix (denied permission, no GPS hardware, timed out) — this is the
+    // server-side backstop for any caller that bypasses that (an old cached
+    // page, a direct API call), so the requirement is real, not just a UI
+    // nicety.
     const lat = typeof req.body.lat === 'number' ? req.body.lat : null;
     const lng = typeof req.body.lng === 'number' ? req.body.lng : null;
-    if (lat != null && lng != null && school.anchorLat != null && school.anchorLng != null) {
+    if (lat == null || lng == null) {
+      return res.status(400).json({
+        error: 'We need your location to check in or out. Please allow this site to access your location in your browser settings and try again.',
+        locationRequired: true
+      });
+    }
+
+    let distanceM = null;
+    let outOfCoverage = false;
+    // A location is always captured now, but there's only something to
+    // *compare* it against once the school has a GPS anchor set — a school
+    // with no anchor yet has nothing to check distance against and is let
+    // through unconditionally, same as before this change (see README
+    // "Out-of-coverage check-ins" for why that carve-out stays deliberate
+    // rather than blocking every check-in at a not-yet-anchored school).
+    if (school.anchorLat != null && school.anchorLng != null) {
       distanceM = distanceMeters(lat, lng, school.anchorLat, school.anchorLng);
       outOfCoverage = distanceM > FLAG_DISTANCE_METERS;
     }
@@ -257,7 +295,11 @@ router.post('/schools/:id/attendance', async (req, res, next) => {
       name: record.name,
       verified: record.verified,
       distanceM: record.distanceM,
-      flagged: record.flagged
+      flagged: record.flagged,
+      // Only meaningful for a check-in — nothing to judge "on time" about a
+      // check-out — so the check-in page can show it right on the
+      // confirmation screen, not just later in Records/Teachers.
+      arrivalStatus: record.type === 'in' ? arrivalStatus(record.at) : null
     });
   } catch (err) {
     next(err);

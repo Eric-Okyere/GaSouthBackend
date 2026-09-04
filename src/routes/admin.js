@@ -6,10 +6,19 @@ const TermSettings = require('../models/TermSettings');
 const { requireAdmin } = require('../middleware/auth');
 const { generateUniqueCode, ensureCode, ensureCodesForList } = require('../utils/schoolCode');
 const { toCSV } = require('../utils/csv');
-const { dateStr, dayBounds, daysBetween, startOfMonthStr } = require('../utils/time');
+const { dateStr, dayBounds, daysBetween, startOfMonthStr, arrivalStatus } = require('../utils/time');
+const { staffIdTakenElsewhere } = require('../utils/teacherUniqueness');
 
 const router = express.Router();
 router.use(requireAdmin);
+
+/** Escapes regex special characters in user-supplied text before it's used
+ *  inside a RegExp — needed for the case-insensitive exact-name duplicate
+ *  checks below, so a school name containing e.g. "(" or "." is matched
+ *  literally instead of as regex syntax. */
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 /* ------------------------------- Schools ------------------------------- */
 
@@ -18,6 +27,48 @@ router.get('/schools', async (req, res, next) => {
     const schools = await School.find().sort({ name: 1 }).lean();
     await ensureCodesForList(School, schools);
     res.json(schools.map(toSchoolJSON));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /schools/export — every school as CSV, schools only (no teachers) —
+ * one of five export shapes the admin can pick from (see also
+ * /teachers/export?school= for one school's teachers only, /export/all?school=
+ * for one school AND its own details combined with its teachers in one
+ * file, /export/all with no filter for every school with every teacher, and
+ * /teachers/export with no filter for the flat district-wide teacher list).
+ * Registered before /schools/:id so the literal path here isn't swallowed
+ * as an :id value of "export".
+ */
+router.get('/schools/export', async (req, res, next) => {
+  try {
+    const schools = await School.find().sort({ name: 1 }).lean();
+    await ensureCodesForList(School, schools);
+
+    const teachers = await Teacher.find({}).select('school').lean();
+    const teacherCountBySchool = new Map();
+    for (const t of teachers) {
+      const key = String(t.school);
+      teacherCountBySchool.set(key, (teacherCountBySchool.get(key) || 0) + 1);
+    }
+
+    const header = ['Name', 'Code', 'Active', 'GPS Anchor Set', 'Anchor Lat', 'Anchor Lng', 'Teacher Count'];
+    const rows = [header, ...schools.map((s) => [
+      s.name,
+      s.code || '',
+      s.active ? 'Yes' : 'No',
+      s.anchorLat != null ? 'Yes' : 'No',
+      s.anchorLat ?? '',
+      s.anchorLng ?? '',
+      teacherCountBySchool.get(String(s._id)) || 0
+    ])];
+
+    const csv = toCSV(rows);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="ga-south-schools.csv"');
+    res.send(csv);
   } catch (err) {
     next(err);
   }
@@ -38,6 +89,16 @@ router.post('/schools', async (req, res, next) => {
   try {
     const name = String(req.body.name || '').trim();
     if (!name) return res.status(400).json({ error: 'School name is required.' });
+
+    // Exact-name duplicates only (case/whitespace-insensitive) — two
+    // genuinely different names that happen to look similar, e.g. "Galilea
+    // M/A 2 Primary" and "Galilea M/A 2 JHS", are two different schools and
+    // stay allowed; this only catches the same name being typed in twice.
+    const dup = await School.findOne({ name: new RegExp(`^${escapeRegex(name)}$`, 'i') }).lean();
+    if (dup) {
+      return res.status(409).json({ error: `A school named "${name}" already exists.`, duplicateName: true });
+    }
+
     // Short check-in link code, assigned up front — see utils/schoolCode.js.
     const code = await generateUniqueCode(School);
     const school = await School.create({ name, code });
@@ -53,6 +114,13 @@ router.patch('/schools/:id', async (req, res, next) => {
     if (typeof req.body.name === 'string') {
       const name = req.body.name.trim();
       if (!name) return res.status(400).json({ error: 'School name cannot be empty.' });
+      // Same exact-name duplicate check as creation, excluding this school
+      // itself so a case-only fix (or saving with nothing changed) isn't
+      // rejected as colliding with its own current name.
+      const dup = await School.findOne({ _id: { $ne: req.params.id }, name: new RegExp(`^${escapeRegex(name)}$`, 'i') }).lean();
+      if (dup) {
+        return res.status(409).json({ error: `A school named "${name}" already exists.`, duplicateName: true });
+      }
       update.name = name;
     }
     if (typeof req.body.active === 'boolean') update.active = req.body.active;
@@ -149,6 +217,15 @@ router.post('/schools/:id/teachers', async (req, res, next) => {
     const school = await School.findById(req.params.id).lean();
     if (!school) return res.status(404).json({ error: 'School not found.' });
 
+    // Same district-wide staff-ID uniqueness self-registration enforces —
+    // see utils/teacherUniqueness.js.
+    if (await staffIdTakenElsewhere(Teacher, staffId, school._id)) {
+      return res.status(409).json({
+        error: 'That staff ID is already registered at a different school.',
+        staffIdTakenElsewhere: true
+      });
+    }
+
     const teacher = await Teacher.create({ school: school._id, staffId, name });
     res.status(201).json(toTeacherJSON(teacher));
   } catch (err) {
@@ -173,6 +250,10 @@ router.post('/schools/:id/teachers/bulk', async (req, res, next) => {
       const name = String(row.name || '').trim();
       if (!staffId || !name) {
         skipped.push({ row, reason: 'missing staffId or name' });
+        continue;
+      }
+      if (await staffIdTakenElsewhere(Teacher, staffId, school._id)) {
+        skipped.push({ row, reason: 'staff ID already registered at a different school' });
         continue;
       }
       const result = await Teacher.findOneAndUpdate(
@@ -211,6 +292,19 @@ router.patch('/teachers/:id', async (req, res, next) => {
     if (typeof body.staffId === 'string') {
       const staffId = body.staffId.trim().toUpperCase();
       if (!staffId) return res.status(400).json({ error: 'Staff ID cannot be empty.' });
+
+      const current = await Teacher.findById(req.params.id).lean();
+      if (!current) return res.status(404).json({ error: 'Teacher not found.' });
+      // Only worth the extra lookup when the staff ID is actually changing —
+      // same district-wide uniqueness check as everywhere else a staffId is
+      // set (see utils/teacherUniqueness.js). A collision at the SAME school
+      // is still caught below by the existing unique-index 11000 handling.
+      if (staffId !== current.staffId && (await staffIdTakenElsewhere(Teacher, staffId, current.school, current._id))) {
+        return res.status(409).json({
+          error: 'That staff ID is already registered at a different school.',
+          staffIdTakenElsewhere: true
+        });
+      }
       update.staffId = staffId;
     }
     if (typeof body.active === 'boolean') update.active = body.active;
@@ -467,7 +561,7 @@ router.get('/teachers/export', async (req, res, next) => {
     const status = date ? await loadDistrictDayStatus(date) : null;
 
     const header = ['Name', 'Staff ID', 'School', 'Active', 'Class Teaching', 'Association', 'Phone', 'Source', 'Device Bound'];
-    if (date) header.push('Status', 'Checked In At', 'Checked Out At');
+    if (date) header.push('Status', 'Arrival', 'Checked In At', 'Checked Out At');
 
     const rows = [header, ...teachers.map((t) => {
       const row = [
@@ -485,13 +579,87 @@ router.get('/teachers/export', async (req, res, next) => {
         const key = `${t.school ? t.school._id : t.school}|${t.staffId}`;
         const checkedInAt = status.inMap.get(key);
         const checkedOutAt = status.outMap.get(key);
-        row.push(checkedInAt ? 'Present' : 'Absent', checkedInAt ? new Date(checkedInAt).toISOString() : '', checkedOutAt ? new Date(checkedOutAt).toISOString() : '');
+        row.push(
+          checkedInAt ? 'Present' : 'Absent',
+          checkedInAt ? (arrivalStatus(checkedInAt) === 'late' ? 'Late' : 'Early') : '',
+          checkedInAt ? new Date(checkedInAt).toISOString() : '',
+          checkedOutAt ? new Date(checkedOutAt).toISOString() : ''
+        );
       }
       return row;
     })];
 
     const csv = toCSV(rows);
     const filename = `ga-south-teachers${date ? '-' + date : ''}.csv`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * GET /export/all?school= — every school with every one of its teachers, in
+ * one CSV — the fourth export shape (alongside /schools/export, one
+ * school's teachers via /teachers/export?school=, and the flat
+ * district-wide list via /teachers/export with no filter). A school with no
+ * teachers on its roster still gets exactly one row, with the teacher
+ * columns blank, so a school that hasn't onboarded anyone yet is visible in
+ * the export rather than silently missing from it — the flat
+ * /teachers/export list can't show that, since it only ever has one row per
+ * teacher.
+ *
+ * The optional `school` filter narrows this to exactly one school — this is
+ * what makes it a fifth, combined "one school, and its teachers, in a
+ * single file" shape too (distinct from /teachers/export?school=, which
+ * lists that school's teachers but has no row carrying the school's own
+ * details — GPS anchor, active status, code). Same route, same shape,
+ * just filtered.
+ */
+router.get('/export/all', async (req, res, next) => {
+  try {
+    const schoolFilter = req.query.school ? { _id: req.query.school } : {};
+    const teacherFilter = req.query.school ? { school: req.query.school } : {};
+    const [schools, teachers] = await Promise.all([
+      School.find(schoolFilter).sort({ name: 1 }).lean(),
+      Teacher.find(teacherFilter).sort({ name: 1 }).lean()
+    ]);
+    await ensureCodesForList(School, schools);
+
+    const teachersBySchool = new Map();
+    for (const t of teachers) {
+      const key = String(t.school);
+      if (!teachersBySchool.has(key)) teachersBySchool.set(key, []);
+      teachersBySchool.get(key).push(t);
+    }
+
+    const header = [
+      'School', 'School Code', 'School Active',
+      'Teacher Name', 'Staff ID', 'Teacher Active', 'Class Teaching', 'Association', 'Phone', 'Source', 'Device Bound'
+    ];
+    const rows = [header];
+    for (const s of schools) {
+      const roster = teachersBySchool.get(String(s._id)) || [];
+      if (!roster.length) {
+        rows.push([s.name, s.code || '', s.active ? 'Yes' : 'No', '', '', '', '', '', '', '', '']);
+        continue;
+      }
+      for (const t of roster) {
+        rows.push([
+          s.name, s.code || '', s.active ? 'Yes' : 'No',
+          t.name, t.staffId, t.active ? 'Yes' : 'No',
+          t.classTeaching || '', t.association || '', t.phoneNumber || '',
+          t.source === 'self' ? 'Self-registered' : 'Admin-added',
+          t.deviceTokenHash ? 'Yes' : 'No'
+        ]);
+      }
+    }
+
+    const csv = toCSV(rows);
+    const filename = req.query.school && schools[0]
+      ? `ga-south-${schools[0].code || schools[0]._id}-and-teachers.csv`
+      : 'ga-south-schools-and-teachers.csv';
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(csv);
@@ -568,10 +736,14 @@ function toDirectoryTeacherJSON(t, status) {
   };
   if (status) {
     const key = `${t.school ? t.school._id : t.school}|${t.staffId}`;
+    const checkedInAt = status.inMap.get(key) || null;
     json.attendanceStatus = {
       date: status.date,
-      checkedInAt: status.inMap.get(key) || null,
-      checkedOutAt: status.outMap.get(key) || null
+      checkedInAt,
+      checkedOutAt: status.outMap.get(key) || null,
+      // null when absent — nothing to judge "late"/"early" about a day
+      // with no check-in at all.
+      arrivalStatus: checkedInAt ? arrivalStatus(checkedInAt) : null
     };
   }
   return json;
@@ -589,6 +761,36 @@ function buildRecordFilter(query) {
   return filter;
 }
 
+/**
+ * Attaches `hoursSpent` to each Attendance record: for a check-OUT row, the
+ * elapsed time since that same person's check-IN the same day at the same
+ * school, in hours (2 decimal places) — or null if there's no matching
+ * check-in on file (an edited/legacy record) or the row is itself a
+ * check-in (nothing to measure yet, until its check-out shows up). One
+ * batched lookup for the whole set, not one query per row — same pattern as
+ * loadDistrictDayStatus above.
+ */
+async function attachHoursSpent(records) {
+  const outRows = records.filter((r) => r.type === 'out');
+  if (!outRows.length) return records.map((r) => ({ ...r, hoursSpent: null }));
+
+  const dateKeys = [...new Set(outRows.map((r) => r.dateKey))];
+  const staffIds = [...new Set(outRows.map((r) => r.staffId))];
+  const ins = await Attendance.find({ type: 'in', dateKey: { $in: dateKeys }, staffId: { $in: staffIds } })
+    .select('school staffId dateKey at')
+    .lean();
+  const inAtByKey = new Map(ins.map((r) => [`${r.school}|${r.staffId}|${r.dateKey}`, r.at]));
+
+  return records.map((r) => {
+    if (r.type !== 'out') return { ...r, hoursSpent: null };
+    const schoolId = r.school && r.school._id ? r.school._id : r.school;
+    const inAt = inAtByKey.get(`${schoolId}|${r.staffId}|${r.dateKey}`);
+    if (!inAt) return { ...r, hoursSpent: null };
+    const hours = (new Date(r.at).getTime() - new Date(inAt).getTime()) / 3600000;
+    return { ...r, hoursSpent: Math.round(hours * 100) / 100 };
+  });
+}
+
 router.get('/records', async (req, res, next) => {
   try {
     const filter = buildRecordFilter(req.query);
@@ -604,12 +806,13 @@ router.get('/records', async (req, res, next) => {
         .lean(),
       Attendance.countDocuments(filter)
     ]);
+    const withHours = await attachHoursSpent(records);
 
     res.json({
       total,
       page,
       pageSize,
-      records: records.map(toRecordJSON)
+      records: withHours.map(toRecordJSON)
     });
   } catch (err) {
     next(err);
@@ -630,18 +833,21 @@ router.get('/records/export', async (req, res, next) => {
   try {
     const filter = buildRecordFilter(req.query);
     const records = await Attendance.find(filter).sort({ at: -1 }).populate('school', 'name').lean();
+    const withHours = await attachHoursSpent(records);
 
-    const header = ['Date', 'Time', 'School', 'Teacher Name', 'Staff ID', 'Type', 'Verified', 'Distance (m)', 'Flagged'];
-    const rows = [header, ...records.map((r) => [
+    const header = ['Date', 'Time', 'School', 'Teacher Name', 'Staff ID', 'Type', 'Arrival', 'Verified', 'Distance (m)', 'Flagged', 'Hours Spent'];
+    const rows = [header, ...withHours.map((r) => [
       r.dateKey,
       new Date(r.at).toISOString(),
       r.school ? r.school.name : '(deleted school)',
       r.name,
       r.staffId,
       r.type === 'in' ? 'Check-in' : 'Check-out',
+      r.type === 'in' ? (arrivalStatus(r.at) === 'late' ? 'Late' : 'Early') : '',
       r.verified ? 'Yes' : 'No',
       r.distanceM ?? '',
-      r.flagged ? 'Yes' : 'No'
+      r.flagged ? 'Yes' : 'No',
+      r.hoursSpent != null ? r.hoursSpent.toFixed(2) : ''
     ])];
 
     const csv = toCSV(rows);
@@ -665,7 +871,11 @@ function toRecordJSON(r) {
     distanceM: r.distanceM,
     flagged: r.flagged,
     at: r.at,
-    dateKey: r.dateKey
+    dateKey: r.dateKey,
+    hoursSpent: r.hoursSpent ?? null,
+    // Only meaningful on a check-in row — there's nothing to judge "on
+    // time" about a check-out — so this is always null for type "out".
+    arrivalStatus: r.type === 'in' ? arrivalStatus(r.at) : null
   };
 }
 

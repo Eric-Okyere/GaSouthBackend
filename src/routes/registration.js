@@ -2,6 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const School = require('../models/School');
 const Teacher = require('../models/Teacher');
+const { staffIdTakenElsewhere } = require('../utils/teacherUniqueness');
 
 // Note on device binding: registration deliberately never sets or touches
 // deviceTokenHash. This form is meant to be fillable by anyone on a
@@ -70,6 +71,17 @@ router.post('/register', async (req, res, next) => {
     }
     const school = await School.findOne({ _id: schoolId, active: true }).lean();
     if (!school) return res.status(404).json({ error: 'Please choose a valid school.' });
+
+    // A staff ID already on file at a DIFFERENT school is a mistake to
+    // catch here, not silently allow — see utils/teacherUniqueness.js.
+    // Registering again at the SAME school (a typo correction) is fine and
+    // handled below, unaffected by this check.
+    if (await staffIdTakenElsewhere(Teacher, staffId, school._id)) {
+      return res.status(409).json({
+        error: 'This staff ID is already registered at a different school. If this teacher has transferred schools, ask the district admin to remove their old record first.',
+        staffIdTakenElsewhere: true
+      });
+    }
 
     const existing = await Teacher.findOne({ school: school._id, staffId }).lean();
     const teacher = await Teacher.findOneAndUpdate(

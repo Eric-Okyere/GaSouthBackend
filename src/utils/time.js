@@ -46,4 +46,19 @@ function startOfMonthStr(dateString = dateStr()) {
   return dateString.slice(0, 7) + '-01';
 }
 
-module.exports = { TZ, dateStr, dayBounds, isWeekend, daysBetween, startOfMonthStr };
+// 7:30am, the district-wide cutoff a check-in is judged against — "late" if
+// strictly after this, "early" otherwise (so a check-in at exactly 7:30:00
+// counts as early, not late).
+const LATE_CUTOFF_MINUTES = 7 * 60 + 30;
+
+/** 'late' or 'early' for a check-in timestamp, judged against the 7:30am
+ *  Africa/Accra cutoff. Accra is UTC+0 with no DST, so a Date's UTC
+ *  hour/minute already IS its Accra local time — no timezone conversion
+ *  needed beyond that (same reasoning `dayBounds` already relies on). */
+function arrivalStatus(at) {
+  const d = at instanceof Date ? at : new Date(at);
+  const minutes = d.getUTCHours() * 60 + d.getUTCMinutes();
+  return minutes > LATE_CUTOFF_MINUTES ? 'late' : 'early';
+}
+
+module.exports = { TZ, dateStr, dayBounds, isWeekend, daysBetween, startOfMonthStr, LATE_CUTOFF_MINUTES, arrivalStatus };
